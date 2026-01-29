@@ -13,7 +13,7 @@ After training, the model analyzes feature importance to determine which statist
 
 Visualizations:
 <img width="3257" height="2070" alt="feature_importance" src="https://github.com/user-attachments/assets/1c94e08d-a726-4460-a3e7-de5276226037" />
-<img width="3267" height="2668" alt="predictions_vs_actual" src="https://github.com/user-attachments/assets/39d1e44a-63a7-4845-8162-3eb98df27f21" /><img width="4468" height="1768" alt="quick_start_results" src="https://github.com/user-attachments/assets/42be457e-3fdc-47a4-96b7-cb8aca1843dc" />
+<img width="4468" height="1768" alt="quick_start_results" src="https://github.com/user-attachments/assets/42be457e-3fdc-47a4-96b7-cb8aca1843dc" />
 <img width="3834" height="2668" alt="salary_vs_performance" src="https://github.com/user-attachments/assets/43170f24-9321-448d-893a-ed349813d55c" />
 
 
