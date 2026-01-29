@@ -12,6 +12,11 @@ The machine learning phase begins by splitting the matched player data into trai
 After training, the model analyzes feature importance to determine which statistics have the strongest influence on salary predictions. Typically, points per game carries the most weight, followed by Win Shares and EPA, with assists and True Shooting Percentage also playing significant roles. The model uses these importance weights to create a composite "Performance Metric" that scores each player on a 0-100 scale, representing their overall value based on the statistics that matter most for salary.
 
 Visualizations:
+<img width="3257" height="2070" alt="feature_importance" src="https://github.com/user-attachments/assets/1c94e08d-a726-4460-a3e7-de5276226037" />
+<img width="3267" height="2668" alt="predictions_vs_actual" src="https://github.com/user-attachments/assets/39d1e44a-63a7-4845-8162-3eb98df27f21" /><img width="4468" height="1768" alt="quick_start_results" src="https://github.com/user-attachments/assets/42be457e-3fdc-47a4-96b7-cb8aca1843dc" />
+<img width="3834" height="2668" alt="salary_vs_performance" src="https://github.com/user-attachments/assets/43170f24-9321-448d-893a-ed349813d55c" />
+
+
 The program generates three professional-quality PNG visualizations that help interpret the results. The Feature Importance chart displays a horizontal bar graph showing which statistics the model weighs most heavily when predicting salaries, revealing that scoring ability and advanced metrics like Win Shares are the primary drivers of compensation. The Predictions vs Actual chart plots the model's salary predictions against the real salaries on a scatter plot, with a perfect prediction line showing where points would fall if the model were 100% accurate - most points cluster near this line, demonstrating strong model performance. The Salary vs Performance chart creates a scatter plot with salary on the x-axis and the composite performance metric on the y-axis, with a trend line showing the overall relationship and annotations highlighting the top performers, making it easy to spot players who may be underpaid or overpaid relative to their statistical production.
 
 Interactive Predictions:
