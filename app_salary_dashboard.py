@@ -1,10 +1,9 @@
 # app_salary_dashboard.py
 """
 Streamlit dashboard for NBA Salary Predictor
-- Removes slider for top players (fixed top-10)
-- Parses human-formatted salary strings into numeric dollars before training
-- Trains model, fits a small linear calibrator on predictions -> actuals
-- Shows calibrated predictions in top players table and interactive predictor
+- Top players table now includes raw numeric Predicted_SALARY (dollars)
+- Removed the 'Derived metrics (sample)' section
+- Keeps salary parsing, model training, calibration, and plotting
 """
 
 from pathlib import Path
@@ -139,7 +138,6 @@ def parse_salary_to_numeric(s):
         if s.endswith(("K","k")):
             num = float(s[:-1])
             return num * 1_000.0
-        # sometimes values like '53.32' intended millions? we won't assume that
         # try plain float
         return float(s)
     except Exception:
@@ -498,7 +496,7 @@ except Exception as e:
     st.error(f"Unable to create Salary vs Performance plot: {e}")
 
 # -------------------------
-# Top players table with predicted salary (fixed top-10, slider removed)
+# Top players table with predicted salary (top 10; Predicted_SALARY is raw numeric dollars)
 # -------------------------
 st.subheader("Top players by performance metric (top 10)")
 try:
@@ -507,7 +505,7 @@ try:
     present_cols = [c for c in display_cols if c in df_perf.columns]
     top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
 
-    def _pred_row(r):
+    def _pred_row_raw(r):
         stats = {
             'PTS': float(r.get('PTS',0.0)),
             'REB': float(r.get('REB',0.0)),
@@ -520,15 +518,16 @@ try:
         }
         try:
             pred, _, _ = predict_salary_calibrated(model_obj, stats)
-            return pred
+            return pred  # raw dollars (float)
         except Exception:
             return np.nan
 
-    top_players['Predicted_SALARY'] = top_players.apply(_pred_row, axis=1)
-    if 'SALARY' in top_players.columns:
-        top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
-    top_players['Predicted_SALARY'] = top_players['Predicted_SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+    top_players['Predicted_SALARY'] = top_players.apply(_pred_row_raw, axis=1)
+
+    # keep SALARY numeric (already parsed earlier)
     top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
+
+    # show raw predicted salary in dollars (no pretty formatting)
     st.dataframe(top_players.reset_index(drop=True))
 except Exception as e:
     st.error(f"Error building top players table: {e}")
@@ -556,22 +555,16 @@ if submit:
     stats = {'PTS': pts, 'REB': reb, 'AST': ast, 'BLK': blk, 'STL': stl, 'TS_PCT': ts_pct, 'WIN_SHARES': win_shares, 'EPA': epa}
     try:
         pred, low, high = predict_salary_calibrated(model_obj, stats)
-        st.success(f"Predicted salary: ${pred:,.0f}  (Range: ${low:,.0f} — ${high:,.0f})")
+        st.success(f"Predicted salary (raw dollars): {pred:.2f}  (Range: {low:.2f} — {high:.2f})")
     except Exception as e:
         st.error(f"Prediction failed: {e}")
 
 # -------------------------
-# Downloads & bottom derived metrics display
+# Downloads & footer
 # -------------------------
 st.header("Export & downloads")
 st.download_button(label="Download feature importance CSV", data=table_df.to_csv(index=False).encode('utf-8'), file_name="feature_importance.csv")
 st.download_button(label="Download merged dataset", data=merged_df.to_csv(index=False).encode('utf-8'), file_name="merged_dataset.csv")
 
 st.markdown("---")
-st.subheader("Derived metrics (sample)")
-try:
-    sample_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','WIN_SHARES','EPA']
-    present = [c for c in sample_cols if c in merged_df.columns]
-    st.dataframe(merged_df[present].head(15))
-except Exception:
-    st.write("No derived metrics to show.")
+st.caption("Notes: Predicted_SALARY column is raw numeric dollars (no string formatting). Predictions are calibrated by a simple linear fit on model predictions -> actuals to reduce systematic bias.")
