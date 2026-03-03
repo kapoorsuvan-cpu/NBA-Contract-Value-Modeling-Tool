@@ -1,14 +1,14 @@
 # app_salary_dashboard.py
 """
-Streamlit dashboard for NBA Salary Predictor
-Updated: calibration of predicted salaries, stable slider, fixed feature-importance display,
-no statsmodels dependency, and predicted salary column for top players.
+Streamlit dashboard for NBA Salary Predictor (updated with stats column normalization)
+- Normalizes common stats column names so add_advanced_metrics won't KeyError.
+- Keeps calibration, fixed feature importance, safe slider, predicted salary column.
 """
 
 from pathlib import Path
 import io
 import time
-from typing import Optional
+from typing import Optional, Dict
 
 import streamlit as st
 import pandas as pd
@@ -29,7 +29,7 @@ except Exception as e:
     st.stop()
 
 st.set_page_config(page_title="NBA Salary Predictor", layout="wide")
-st.title("NBA Salary Predictor — Dashboard (Updated)")
+st.title("NBA Salary Predictor — Dashboard (Normalization + Fixes)")
 
 # -------------------------
 # Sidebar & inputs
@@ -49,7 +49,7 @@ else:
 
 train_button = st.sidebar.button("Train / Retrain model")
 st.sidebar.markdown("---")
-st.sidebar.write("The model expects numeric features: PTS, REB, AST, BLK, STL, TS_PCT, WIN_SHARES, EPA")
+st.sidebar.write("Model numeric features expected: PTS, REB, AST, BLK, STL, TS_PCT, WIN_SHARES, EPA")
 
 # -------------------------
 # Utilities
@@ -111,6 +111,45 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
     df["TEAM"] = df["TEAM"].astype(str).str.strip()
     return df
 
+def normalize_stats_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map common variants of NBA stat column names to expected canonical names.
+    Returns a copy with renamed columns.
+    """
+    df = df.copy()
+    colmap = {}
+    lower = {c.lower(): c for c in df.columns}
+
+    # mapping list: canonical -> list of possible names
+    possible = {
+        "PTS": ["pts", "points", "ppg", "pts_per_game", "pts_pg", "pt"],
+        "REB": ["reb", "rebounds", "rpg", "rebounds_per_game", "reb_pg"],
+        "AST": ["ast", "assists", "apg", "ast_pg", "assists_per_game"],
+        "BLK": ["blk", "blocks", "bpg", "blocks_per_game"],
+        "STL": ["stl", "steals", "spg", "steals_per_game"],
+        "FGA": ["fga", "fga_per_game", "fga_pg"],
+        "FGM": ["fgm", "fgm_per_game", "fgm_pg"],
+        "FTA": ["fta", "fta_per_game", "fta_pg"],
+        "TS_PCT": ["ts_pct", "ts%", "true_shooting_pct", "true_shooting_percentage", "ts"],
+        "GP": ["gp", "games", "games_played"],
+        "FG3_PCT": ["fg3_pct", "fg3%", "three_pt_pct", "3p%"],
+    }
+
+    for canonical, variants in possible.items():
+        found = None
+        for v in variants:
+            if v.lower() in lower:
+                found = lower[v.lower()]
+                break
+        if found:
+            colmap[found] = canonical
+
+    # If some canonical expected columns are already present, keep them (no-op).
+    # Perform rename
+    if colmap:
+        df = df.rename(columns=colmap)
+    return df
+
 # -------------------------
 # Load / prepare data
 # -------------------------
@@ -137,15 +176,12 @@ else:
         st.error(f"Failed to read salary CSV: {e}")
         st.stop()
 
-    # Normalize salary columns immediately
+    # Normalize salary columns
     try:
         salary_df = _ensure_salary_columns(salary_df)
     except Exception as e:
         st.error(f"Failed to normalize salary CSV: {e}")
         st.stop()
-
-    st.sidebar.write("Salary columns detected:")
-    st.sidebar.write(salary_df.columns.tolist())
 
     # Stats: uploaded or fetch
     if stats_file is not None:
@@ -185,58 +221,69 @@ else:
 
     st.success(f"Merged dataset contains {len(merged_df)} players.")
 
-# ---------- derived metrics (compute now; display later) ----------
-merged_df = collector.add_advanced_metrics(merged_df)
+# ---------- normalize stats columns BEFORE advanced metrics ----------
+merged_df = normalize_stats_columns(merged_df)
+
+# Check that required raw stats exist before calling add_advanced_metrics
+expected_raw = ["PTS", "REB", "AST", "BLK", "STL", "FGA", "FGM", "FTA", "GP"]
+missing_raw = [c for c in expected_raw if c not in merged_df.columns]
+
+if missing_raw:
+    st.error(
+        "Your merged stats are missing required columns needed to compute derived metrics:\n\n"
+        f"{missing_raw}\n\n"
+        "Available columns in your merged dataset:\n\n"
+        f"{list(merged_df.columns)}\n\n"
+        "Please upload a stats CSV with standard column names or adjust your file so the dashboard can compute derived metrics."
+    )
+    st.stop()
+
+# Now compute derived metrics (safe)
+try:
+    merged_df = collector.add_advanced_metrics(merged_df)
+except KeyError as e:
+    st.error(f"add_advanced_metrics failed - missing column: {e}. Available columns: {list(merged_df.columns)}")
+    st.stop()
+except Exception as e:
+    st.error(f"add_advanced_metrics failed: {e}")
+    st.stop()
 
 st.write("Preview (first 6 rows):")
 st.dataframe(merged_df.head(6))
 
-required_features = ["PTS", "REB", "AST", "BLK", "STL", "TS_PCT", "WIN_SHARES", "EPA", "SALARY"]
-missing = require_columns(merged_df, required_features)
+required_features = ["PTS", "REB", "AST", "BLK", "STL", "TS_PCT", "WIN_SHARES", "EPA", "Salary", "SALARY"]
+# note: ensure 'SALARY' column exists - earlier _ensure_salary_columns should have created it
+if 'SALARY' not in merged_df.columns and 'Salary' in merged_df.columns:
+    merged_df['SALARY'] = merged_df['Salary']
+
+missing = require_columns(merged_df, ["PTS", "REB", "AST", "BLK", "STL", "TS_PCT", "WIN_SHARES", "EPA", "SALARY"])
 if missing:
-    st.error(f"Missing required columns needed for training: {missing}")
+    st.error(f"Missing required columns needed for training: {missing}. Columns present: {list(merged_df.columns)}")
     st.stop()
 
 # -------------------------
-# Train model
+# Train model & calibrate
 # -------------------------
 st.header("Model training & diagnostics")
 @st.cache_resource
 def _train_and_calibrate(df: pd.DataFrame, optimize=True):
-    """
-    Train the SalaryPredictionModel and create a small calibrator mapping
-    predicted -> actual to correct systematic scale bias.
-    Returns: model_obj, X_test, y_test, y_pred_test, df_perf
-    and attaches calibrator to model_obj as model_obj._calibrator
-    """
     model_obj = SalaryPredictionModel()
     X, y = model_obj.prepare_features(df)
     X_test, y_test, y_pred_test = model_obj.train(X, y, optimize=optimize)
 
-    # Fit a simple linear calibrator on model's predictions on the full set
+    # calibrate predictions -> actual (linear regression on model preds)
     try:
         preds_full = model_obj.model.predict(model_obj.scaler.transform(X))
         calibrator = LinearRegression()
         calibrator.fit(preds_full.reshape(-1,1), y)
         model_obj._calibrator = calibrator
     except Exception:
-        # If anything fails, attach identity calibrator
-        calibrator = LinearRegression()
-        try:
-            preds_full = model_obj.model.predict(model_obj.scaler.transform(X))
-            calibrator.fit(preds_full.reshape(-1,1), y)
-            model_obj._calibrator = calibrator
-        except Exception:
-            model_obj._calibrator = None
+        model_obj._calibrator = None
 
-    # create performance metric
     df_perf = model_obj.create_performance_metric(df.copy())
-
     return model_obj, X_test, y_test, y_pred_test, df_perf
 
-# Decide whether to train now
 do_train = train_button or not st.session_state.get("trained_once", False)
-
 if do_train:
     with st.spinner("Training (this can take 20-60s depending on dataset & model)..."):
         try:
@@ -251,39 +298,30 @@ else:
     if not st.session_state.get("trained_once", False):
         st.stop()
 
-# Safety check
 if 'model_obj' not in locals() or model_obj is None:
-    st.error("Model object not available after training. Aborting.")
+    st.error("Model object not available after training.")
     st.stop()
 
-# Helper: predict using model + calibrator (local, so we don't depend on external class method)
-def predict_salary_calibrated(model_obj, stats: dict):
-    """
-    stats: dict with feature names expected by model_obj.feature_names
-    returns: calibrated_prediction, lower, upper
-    """
+def predict_salary_calibrated(model_obj, stats: Dict[str,float]):
     X = np.array([[stats[f] for f in model_obj.feature_names]])
     Xs = model_obj.scaler.transform(X)
     raw = model_obj.model.predict(Xs)[0]
     if getattr(model_obj, "_calibrator", None) is not None:
         try:
-            cal = float(model_obj._calibrator.predict(np.array([[raw]]))[0])
+            cal = float(model_obj._calibrator.predict(np.array([[raw]]) )[0])
         except Exception:
             cal = raw
     else:
         cal = raw
-
-    # produce bounds (±8% as before)
     return float(cal), float(cal*0.92), float(cal*1.08)
 
 # -------------------------
-# Feature importance (fixed)
+# Feature importance (percentage)
 # -------------------------
 st.subheader("Feature importance (percentage of total)")
 fi_df = model_obj.feature_importance.copy()
-# tolerate column names
 if 'Importance' in fi_df.columns and 'importance' not in fi_df.columns:
-    fi_df = fi_df.rename(columns={'Importance': 'importance'})
+    fi_df = fi_df.rename(columns={'Importance':'importance'})
 
 fi_df['abs_importance'] = fi_df['importance'].abs()
 total = fi_df['abs_importance'].sum()
@@ -292,9 +330,8 @@ if total <= 0 or np.isnan(total):
 else:
     fi_df['importance_pct'] = fi_df['abs_importance'] / total * 100.0
 
-# Sort largest -> smallest for table, but plot with ascending for horizontal bar (top = largest)
 table_df = fi_df[['Feature','importance_pct']].sort_values('importance_pct', ascending=False).reset_index(drop=True)
-plot_df = table_df.sort_values('importance_pct', ascending=True)  # ascending for horizontal with top label
+plot_df = table_df.sort_values('importance_pct', ascending=True)
 
 fig_fi = px.bar(
     plot_df,
@@ -306,41 +343,38 @@ fig_fi = px.bar(
     title='Feature importance (percentage of total)'
 )
 fig_fi.update_traces(marker_color='lightskyblue', marker_line_color='black', marker_line_width=1)
-fig_fi.update_layout(height=380, margin=dict(l=140, r=20, t=50, b=40), xaxis_tickformat=',.1f')
+fig_fi.update_layout(height=380, margin=dict(l=140, r=20, t=50, b=40))
 st.plotly_chart(fig_fi, use_container_width=True)
-
-st.table(table_df.astype({"importance_pct": float}).round(2))
+st.table(table_df.round(2))
 
 # -------------------------
-# Predicted vs Actual (no statsmodels)
+# Predicted vs Actual (no statsmodels dependency)
 # -------------------------
 st.subheader("Predicted vs Actual Salaries (test set)")
 try:
     test_df = pd.DataFrame({"actual": y_test, "predicted": y_pred})
-    # calibrate test predictions too (for display)
     if getattr(model_obj, "_calibrator", None) is not None:
         test_df['predicted_calibrated'] = model_obj._calibrator.predict(test_df['predicted'].values.reshape(-1,1))
     else:
         test_df['predicted_calibrated'] = test_df['predicted']
 
-    test_df['actual_m'] = test_df['actual'] / 1e6
-    test_df['predicted_m'] = test_df['predicted_calibrated'] / 1e6
+    test_df['actual_m'] = test_df['actual']/1e6
+    test_df['predicted_m'] = test_df['predicted_calibrated']/1e6
 
     fig_pa = px.scatter(
         test_df,
         x='actual_m',
         y='predicted_m',
-        labels={'actual_m': 'Actual Salary (M$)', 'predicted_m': 'Predicted Salary (M$)'},
-        title='Predicted vs Actual Salaries (test set)',
-        hover_data=[]
+        labels={'actual_m':'Actual Salary (M$)','predicted_m':'Predicted Salary (M$)'},
+        title='Predicted vs Actual Salaries (test set)'
     )
     minv = min(test_df['actual_m'].min(), test_df['predicted_m'].min())
     maxv = max(test_df['actual_m'].max(), test_df['predicted_m'].max())
     fig_pa.add_shape(type="line", x0=minv, y0=minv, x1=maxv, y1=maxv, line=dict(color="red", dash="dash"))
     st.plotly_chart(fig_pa, use_container_width=True)
 
-    r2_val = r2_score(test_df['actual'], test_df['predicted_calibrated']) if len(test_df) > 0 else np.nan
-    mae_val = mean_absolute_error(test_df['actual'], test_df['predicted_calibrated']) if len(test_df) > 0 else np.nan
+    r2_val = r2_score(test_df['actual'], test_df['predicted_calibrated']) if len(test_df)>0 else np.nan
+    mae_val = mean_absolute_error(test_df['actual'], test_df['predicted_calibrated']) if len(test_df)>0 else np.nan
     st.metric("Test MAE", f"${mae_val:,.0f}")
     st.metric("Test R²", f"{r2_val:.3f}")
 except Exception as e:
@@ -351,7 +385,7 @@ except Exception as e:
 # -------------------------
 st.subheader("Salary vs Performance Metric")
 try:
-    df_perf['salary_m'] = df_perf['SALARY'] / 1e6
+    df_perf['salary_m'] = df_perf['SALARY']/1e6
     fig_sp = px.scatter(
         df_perf,
         x='salary_m',
@@ -367,7 +401,7 @@ except Exception as e:
     st.error(f"Unable to create Salary vs Performance plot: {e}")
 
 # -------------------------
-# Top players table with predicted salary (safe slider)
+# Top players table with predicted salary
 # -------------------------
 st.subheader("Top players by performance metric")
 if df_perf is None or model_obj is None:
@@ -375,11 +409,10 @@ if df_perf is None or model_obj is None:
 else:
     top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10, key="top_n")
     try:
-        top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[[
-            'PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY'
-        ]].copy()
+        display_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY']
+        present_cols = [c for c in display_cols if c in df_perf.columns]
+        top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
 
-        # compute predicted salary for each row (using calibrated predictor)
         def _pred_row(r):
             stats = {
                 'PTS': float(r.get('PTS',0.0)),
@@ -392,22 +425,23 @@ else:
                 'EPA': float(r.get('EPA',0.0)) if 'EPA' in r else 0.0
             }
             try:
-                pred, low, high = predict_salary_calibrated(model_obj, stats)
+                pred, _, _ = predict_salary_calibrated(model_obj, stats)
                 return pred
             except Exception:
                 return np.nan
 
         top_players['Predicted_SALARY'] = top_players.apply(_pred_row, axis=1)
-        top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+        # format
+        if 'SALARY' in top_players.columns:
+            top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
         top_players['Predicted_SALARY'] = top_players['Predicted_SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
         top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
-
         st.dataframe(top_players.reset_index(drop=True))
     except Exception as e:
         st.error(f"Error building top players table: {e}")
 
 # -------------------------
-# Interactive predictor (uses calibrated predictor)
+# Interactive predictor
 # -------------------------
 st.header("Interactive predictor — input stats & get predicted salary")
 with st.form("predict_form"):
