@@ -380,7 +380,7 @@ do_train = train_button or not st.session_state.get("trained_once", False)
 if do_train:
     with st.spinner("Training (this can take 20-60s)..."):
         try:
-            model_obj, X_test, y_test, y_pred, df_perf = _train_and_calibrate(merged_df, optimize=True)
+            _train_and_calibrate(merged_df, optimize=True)  # populates cache
             st.session_state["trained_once"] = True
             st.success("Model trained and calibrated.")
         except Exception as e:
@@ -390,6 +390,13 @@ else:
     st.info("Click 'Train / Retrain model' in the sidebar to (re)train.")
     if not st.session_state.get("trained_once", False):
         st.stop()
+
+# Always unpack from cache so model_obj is defined in both branches
+try:
+    model_obj, X_test, y_test, y_pred, df_perf = _train_and_calibrate(merged_df, optimize=True)
+except Exception as e:
+    st.error(f"Failed to load trained model: {e}")
+    st.stop()
 
 if model_obj is None:
     st.error("Model object not available after training.")
