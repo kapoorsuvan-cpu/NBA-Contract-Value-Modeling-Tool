@@ -73,6 +73,77 @@ def require_columns(df, cols):
     missing = [c for c in cols if c not in df.columns]
     return missing
 
+def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize salary_df columns so downstream merge code expects:
+      - LAST_NAME (extracted from a Player-like column)
+      - TEAM (team abbreviation)
+      - Salary (numeric)
+    This is a non-destructive copy; returns a cleaned DataFrame.
+    """
+    df = salary_df.copy()
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # find player-like column (Player, PLAYER, name, player_name, etc.)
+    player_col = None
+    for candidate in ("player", "player_name", "name", "playername", "PLAYER", "Player"):
+        if candidate.lower() in cols_lower:
+            player_col = cols_lower[candidate.lower()]
+            break
+
+    # find team-like column
+    team_col = None
+    for candidate in ("team", "team_abbreviation", "team_abbrev", "tm", "team code", "team_name", "Team"):
+        if candidate.lower() in cols_lower:
+            team_col = cols_lower[candidate.lower()]
+            break
+
+    # If Player-like column found but LAST_NAME missing -> create LAST_NAME
+    if "LAST_NAME" not in df.columns:
+        if player_col is not None:
+            df['LAST_NAME'] = (
+                df[player_col]
+                .astype(str)
+                .str.replace(r'\s+(Jr\.|Sr\.|II|III|IV|V|der|IV\.)$', '', regex=True)
+                .str.strip()
+                .str.split()
+                .str[-1]
+            )
+            st.sidebar.info(f"Created LAST_NAME from `{player_col}`")
+        else:
+            st.sidebar.error("Salary CSV missing a player name column (e.g. 'Player'). Cannot create LAST_NAME.")
+            df['LAST_NAME'] = ""
+
+    # Normalize team column name to TEAM (uppercase) for downstream matching
+    if "TEAM" not in df.columns:
+        if team_col is not None:
+            df['TEAM'] = df[team_col].astype(str).str.strip()
+            st.sidebar.info(f"Created TEAM from `{team_col}`")
+        else:
+            # sometimes salary CSV uses 'Tm' or other - create empty TEAM to avoid KeyError
+            df['TEAM'] = ""
+            st.sidebar.warning("Salary CSV missing a team column; TEAM column created empty. Matching may be weaker.")
+
+    # Ensure Salary column exists and is numeric
+    if 'Salary' not in df.columns:
+        found_salary = None
+        for candidate in ("salary", "sal", "contract_amount", "amount", "Salary", "PAY"):
+            if candidate.lower() in cols_lower:
+                found_salary = cols_lower[candidate.lower()]
+                break
+        if found_salary:
+            df['Salary'] = pd.to_numeric(df[found_salary].astype(str).str.replace(r'[^\d.-]', '' , regex=True), errors='coerce')
+            st.sidebar.info(f"Using `{found_salary}` as Salary column")
+        else:
+            st.sidebar.error("Salary CSV missing a Salary column (e.g. 'Salary'). The merge requires numeric Salary values.")
+            df['Salary'] = pd.NA
+
+    # trim and upper-case LAST_NAME/TEAM to help matching
+    df['LAST_NAME'] = df['LAST_NAME'].astype(str).str.strip()
+    df['TEAM'] = df['TEAM'].astype(str).str.strip()
+
+    return df
+
 # -------------------------
 # Load or fetch data
 # -------------------------
@@ -99,6 +170,18 @@ else:
     except Exception as e:
         st.error(f"Failed to read salary CSV: {e}")
         st.stop()
+
+    # --- NORMALIZE salary_df IMMEDIATELY AFTER LOADING ---
+    try:
+        salary_df = _ensure_salary_columns(salary_df)
+    except Exception as e:
+        st.error(f"Failed while normalizing salary CSV columns: {e}")
+        st.stop()
+
+    # Debug: show salary columns and sample for easier diagnosis
+    st.sidebar.write("Salary CSV columns:", salary_df.columns.tolist())
+    st.sidebar.write("Salary CSV sample (first 5 rows):")
+    st.sidebar.dataframe(salary_df.head(5))
 
     # If stats file uploaded, read it
     if stats_file is not None:
@@ -129,6 +212,7 @@ else:
 
     # We have salary_df and stats_df — prepare and merge using collector functions
     collector.player_stats = stats_df
+    # assign cleaned salary data into collector
     collector.salary_data = salary_df
 
     with st.spinner("Merging stats and salaries..."):
