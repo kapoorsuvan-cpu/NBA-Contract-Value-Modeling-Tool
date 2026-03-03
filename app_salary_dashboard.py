@@ -3,13 +3,12 @@
 Streamlit dashboard for NBA Salary Predictor
 Uses classes and functions from nba_salary_predictor.py in the same repo.
 
-Features:
-- Load/upload salary CSV and optionally stats CSV
-- Option to fetch current season stats via nba_api (may hit rate limits)
-- Train salary model (RandomForest / GradientBoosting selection)
-- Show feature importance (percentage), predicted vs actual, salary vs performance
-- Top players table
-- Interactive prediction form (user inputs stats -> predicted salary + range)
+This updated version:
+- fixes feature importance percentage/labeling
+- removes Plotly trendline to avoid statsmodels dependency
+- moves the Derived metrics UI to the bottom (computation still runs early)
+- fixes Top players slider bug and adds Predicted Salary column
+- defensive checks / clearer error messages
 """
 
 from pathlib import Path
@@ -21,8 +20,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from sklearn.metrics import r2_score, mean_absolute_error
 
-# Try to import your existing code (nba_salary_predictor.py must be in the repo)
+# Import your existing module
 try:
     from nba_salary_predictor import (
         NBADataCollector,
@@ -79,7 +79,7 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
       - LAST_NAME (extracted from a Player-like column)
       - TEAM (team abbreviation)
       - Salary (numeric)
-    This is a non-destructive copy; returns a cleaned DataFrame.
+    This returns a cleaned DataFrame.
     """
     df = salary_df.copy()
     cols_lower = {c.lower(): c for c in df.columns}
@@ -98,7 +98,7 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
             team_col = cols_lower[candidate.lower()]
             break
 
-    # If Player-like column found but LAST_NAME missing -> create LAST_NAME
+    # Create LAST_NAME if missing
     if "LAST_NAME" not in df.columns:
         if player_col is not None:
             df['LAST_NAME'] = (
@@ -114,17 +114,16 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
             st.sidebar.error("Salary CSV missing a player name column (e.g. 'Player'). Cannot create LAST_NAME.")
             df['LAST_NAME'] = ""
 
-    # Normalize team column name to TEAM (uppercase) for downstream matching
+    # Create TEAM if missing
     if "TEAM" not in df.columns:
         if team_col is not None:
             df['TEAM'] = df[team_col].astype(str).str.strip()
             st.sidebar.info(f"Created TEAM from `{team_col}`")
         else:
-            # sometimes salary CSV uses 'Tm' or other - create empty TEAM to avoid KeyError
             df['TEAM'] = ""
-            st.sidebar.warning("Salary CSV missing a team column; TEAM column created empty. Matching may be weaker.")
+            st.sidebar.warning("Salary CSV missing a team column; TEAM created empty. Matching may be weaker.")
 
-    # Ensure Salary column exists and is numeric
+    # Ensure Salary numeric column exists
     if 'Salary' not in df.columns:
         found_salary = None
         for candidate in ("salary", "sal", "contract_amount", "amount", "Salary", "PAY"):
@@ -138,7 +137,7 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
             st.sidebar.error("Salary CSV missing a Salary column (e.g. 'Salary'). The merge requires numeric Salary values.")
             df['Salary'] = pd.NA
 
-    # trim and upper-case LAST_NAME/TEAM to help matching
+    # Trim/strip
     df['LAST_NAME'] = df['LAST_NAME'].astype(str).str.strip()
     df['TEAM'] = df['TEAM'].astype(str).str.strip()
 
@@ -171,14 +170,14 @@ else:
         st.error(f"Failed to read salary CSV: {e}")
         st.stop()
 
-    # --- NORMALIZE salary_df IMMEDIATELY AFTER LOADING ---
+    # Normalize salary_df
     try:
         salary_df = _ensure_salary_columns(salary_df)
     except Exception as e:
         st.error(f"Failed while normalizing salary CSV columns: {e}")
         st.stop()
 
-    # Debug: show salary columns and sample for easier diagnosis
+    # Debug: show salary columns and sample
     st.sidebar.write("Salary CSV columns:", salary_df.columns.tolist())
     st.sidebar.write("Salary CSV sample (first 5 rows):")
     st.sidebar.dataframe(salary_df.head(5))
@@ -205,14 +204,13 @@ else:
         else:
             st.success(f"Fetched {len(stats_df)} player stats from NBA API.")
 
-    # If we now have stats_df, attempt to merge using collector logic
+    # Ensure stats available
     if stats_df is None:
         st.error("No player stats available. Either upload a stats CSV or enable NBA API fetch.")
         st.stop()
 
-    # We have salary_df and stats_df — prepare and merge using collector functions
+    # Assign into collector and merge
     collector.player_stats = stats_df
-    # assign cleaned salary data into collector
     collector.salary_data = salary_df
 
     with st.spinner("Merging stats and salaries..."):
@@ -225,15 +223,14 @@ else:
         st.success(f"Merged dataset contains {len(merged_df)} players.")
 
 # -------------------------
-# Add advanced metrics (WIN_SHARES, EPA)
+# Compute advanced metrics (needed for training/visuals)
 # -------------------------
-st.subheader("Derived metrics")
-with st.spinner("Computing advanced metrics..."):
-    merged_df = collector.add_advanced_metrics(merged_df)
+# (We compute early but will display 'Derived metrics' at the bottom)
+merged_df = collector.add_advanced_metrics(merged_df)
 
-# Quick preview and checks
-st.write("Preview of merged dataset (first 8 rows):")
-st.dataframe(merged_df.head(8))
+# Quick preview (small) — will also show full derived metrics later at bottom
+st.write("Preview of merged dataset (first 6 rows):")
+st.dataframe(merged_df.head(6))
 
 required_features = ['PTS', 'REB', 'AST', 'BLK', 'STL', 'TS_PCT', 'WIN_SHARES', 'EPA', 'SALARY']
 missing = require_columns(merged_df, required_features)
@@ -261,10 +258,9 @@ def train_salary_model(df: pd.DataFrame, optimize=True):
 
     return model_obj, X_test, y_test, y_pred, df_perf
 
-# Trigger training: either on button or cached previous run
+# Trigger training
 do_train = train_button
 if not st.session_state.get("trained_once", False):
-    # we also train automatically first time (unless user wants manual only)
     do_train = True
 
 if do_train:
@@ -279,40 +275,55 @@ if do_train:
 else:
     st.info("Click 'Train / Retrain model' in the sidebar to (re)train.")
 
+# Safety: ensure model_obj defined
+if 'model_obj' not in locals():
+    st.error("Model object not available. Training must complete successfully to use the dashboard.")
+    st.stop()
+
 # -------------------------
 # Diagnostics: feature importance (percentage)
 # -------------------------
 st.subheader("Feature importance (percentage of total)")
 fi_df = model_obj.feature_importance.copy()
-if 'Importance' in fi_df.columns:
-    fi_df = fi_df.rename(columns={'Importance':'importance'})
+
+# Be tolerant of column names
+if 'Importance' in fi_df.columns and 'importance' not in fi_df.columns:
+    fi_df = fi_df.rename(columns={'Importance': 'importance'})
+
+# if model returned zero importances for some reason, avoid divide-by-zero
 fi_df['abs_importance'] = fi_df['importance'].abs()
 total = fi_df['abs_importance'].sum()
-if total == 0:
-    fi_df['importance_pct'] = 0.0
+if total <= 0 or np.isnan(total):
+    # fallback: evenly distribute
+    n = len(fi_df)
+    fi_df['importance_pct'] = 100.0 / n
 else:
     fi_df['importance_pct'] = fi_df['abs_importance'] / total * 100.0
 
-# Plot with Plotly
+# Now sort properly for plotting (largest at top)
+plot_df = fi_df.sort_values('importance_pct', ascending=True).copy()
+
+# Plot with Plotly (text mapping uses the same sorted df)
 fig_fi = px.bar(
-    fi_df.sort_values('importance_pct'),
+    plot_df,
     x='importance_pct',
     y='Feature',
     orientation='h',
-    text=fi_df['importance_pct'].round(2),
+    text=plot_df['importance_pct'].round(1).astype(str) + '%',
     labels={'importance_pct': 'Importance (%)'},
     title='Feature importance (percentage of total)'
 )
-fig_fi.update_layout(height=340, margin=dict(l=60, r=20, t=40, b=20))
+fig_fi.update_traces(marker_color='lightskyblue', marker_line_color='black', marker_line_width=1.0)
+fig_fi.update_layout(height=380, margin=dict(l=140, r=20, t=50, b=40), xaxis_tickformat=',.0f')
 st.plotly_chart(fig_fi, use_container_width=True)
 
-# show table
+# show table (sorted descending)
 fi_table = fi_df[['Feature', 'importance_pct']].sort_values('importance_pct', ascending=False).reset_index(drop=True)
 fi_table['importance_pct'] = fi_table['importance_pct'].round(2)
 st.table(fi_table)
 
 # -------------------------
-# Predictions vs Actual
+# Predictions vs Actual (no statsmodels)
 # -------------------------
 st.subheader("Predicted vs Actual Salaries (test set)")
 try:
@@ -323,13 +334,13 @@ try:
     test_df['actual_m'] = test_df['actual'] / 1e6
     test_df['predicted_m'] = test_df['predicted'] / 1e6
 
+    # Use Plotly scatter without built-in trendline
     fig_pa = px.scatter(
         test_df,
         x='actual_m',
         y='predicted_m',
         labels={'actual_m': 'Actual Salary (M$)', 'predicted_m': 'Predicted Salary (M$)'},
         title='Predicted vs Actual Salaries (test set)',
-        trendline='ols',
         hover_data=[]
     )
     # add perfect prediction line
@@ -338,11 +349,11 @@ try:
     fig_pa.add_shape(type="line", x0=minv, y0=minv, x1=maxv, y1=maxv, line=dict(color="red", dash="dash"))
     st.plotly_chart(fig_pa, use_container_width=True)
 
-    # show metrics
-    r2 = float(np.nan if len(y_test)==0 else np.nan_to_num(np.corrcoef(y_test, y_pred)[0,1])**2)
-    mae = float(np.mean(np.abs(y_test - y_pred)))
-    st.metric("Test MAE", f"${mae:,.0f}")
-    st.metric("Test R² (approx)", f"{r2:.3f}")
+    # compute metrics properly
+    r2_val = r2_score(y_test, y_pred) if len(y_test) > 0 else np.nan
+    mae_val = mean_absolute_error(y_test, y_pred) if len(y_test) > 0 else np.nan
+    st.metric("Test MAE", f"${mae_val:,.0f}")
+    st.metric("Test R²", f"{r2_val:.3f}")
 except Exception as e:
     st.error(f"Unable to create Pred vs Actual plot: {e}")
 
@@ -367,16 +378,47 @@ except Exception as e:
     st.error(f"Unable to create Salary vs Performance plot: {e}")
 
 # -------------------------
-# Top players by performance table
+# Top players by performance table (with predicted salary)
 # -------------------------
 st.subheader("Top players by performance metric")
-top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10)
-top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[[
-    'PLAYER_NAME', 'TEAM_ABBREVIATION', 'PTS', 'REB', 'AST', 'PERFORMANCE_METRIC', 'SALARY'
-]].copy()
-top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${x/1e6:.2f}M")
-top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
-st.dataframe(top_players.reset_index(drop=True))
+# Guard: ensure df_perf and model_obj exist
+if 'df_perf' not in locals() or df_perf is None:
+    st.error("Performance dataframe not available.")
+else:
+    # slider
+    top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10, key="top_players_slider")
+
+    try:
+        top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[[
+            'PLAYER_NAME', 'TEAM_ABBREVIATION', 'PTS', 'REB', 'AST', 'PERFORMANCE_METRIC', 'SALARY'
+        ]].copy()
+
+        # Add predicted salary column using model_obj
+        def _predict_row_salary(r):
+            stats = {
+                'PTS': float(r['PTS']),
+                'REB': float(r['REB']),
+                'AST': float(r['AST']),
+                'BLK': float(r.get('BLK', 0.0)),
+                'STL': float(r.get('STL', 0.0)),
+                'TS_PCT': float(r.get('TS_PCT', 0.0)),
+                'WIN_SHARES': float(r.get('WIN_SHARES', 0.0)),
+                'EPA': float(r.get('EPA', 0.0)),
+            }
+            try:
+                pred, low, high = model_obj.predict_salary(stats)
+                return pred
+            except Exception:
+                return np.nan
+
+        top_players['Predicted_SALARY'] = top_players.apply(_predict_row_salary, axis=1)
+        top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+        top_players['Predicted_SALARY'] = top_players['Predicted_SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+        top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
+
+        st.dataframe(top_players.reset_index(drop=True))
+    except Exception as e:
+        st.error(f"Unable to build top players table: {e}")
 
 # -------------------------
 # Interactive salary predictor
@@ -401,7 +443,6 @@ with st.form("predict_form"):
     submit = st.form_submit_button("Predict salary")
 
 if submit:
-    # prepare stats dict
     stats = {
         'PTS': float(pts),
         'REB': float(reb),
@@ -416,19 +457,19 @@ if submit:
         prediction, lower, upper = model_obj.predict_salary(stats)
         st.success(f"Predicted salary: ${prediction:,.0f}   (Range: ${lower:,.0f} — ${upper:,.0f})")
 
-        # Show contributions (approx): feature importance * scaled value
-        # We'll compute simple contribution proxy = weight_pct * (feature_normalized * coefproxy)
-        fi = model_obj.feature_importance.copy()
-        fi = fi.set_index('Feature')
-        # normalize features using training df ranges (df_perf)
+        # Rough contribution proxy (same approach used earlier)
+        fi_local = model_obj.feature_importance.copy()
+        if 'Importance' in fi_local.columns and 'importance' not in fi_local.columns:
+            fi_local = fi_local.rename(columns={'Importance': 'importance'})
+        fi_local = fi_local.set_index('Feature')
+
         contribs = []
         for feat in model_obj.feature_names:
             val = stats[feat]
-            # normalize to 0-1 using min/max from training df
-            fmin = df_perf[feat].min()
-            fmax = df_perf[feat].max()
+            fmin = df_perf[feat].min() if feat in df_perf.columns else 0.0
+            fmax = df_perf[feat].max() if feat in df_perf.columns else 1.0
             norm = 0.0 if fmax <= fmin else (val - fmin) / (fmax - fmin)
-            weight = fi.loc[feat]['Importance'] if feat in fi.index else 0.0
+            weight = fi_local.loc[feat]['importance'] if (feat in fi_local.index) else 0.0
             contribs.append((feat, weight * norm))
         contrib_df = pd.DataFrame(contribs, columns=['feature', 'contribution_proxy'])
         if contrib_df['contribution_proxy'].abs().sum() > 0:
@@ -443,24 +484,35 @@ if submit:
         st.error(f"Prediction failed: {e}")
 
 # -------------------------
-# Download artifacts
+# Downloads
 # -------------------------
 st.header("Export & downloads")
-if st.button("Download trained model feature importance (CSV)"):
-    st.download_button(
-        label="Download feature importance CSV",
-        data=fi_df[['Feature', 'importance_pct']].to_csv(index=False).encode('utf-8'),
-        file_name='salary_feature_importance.csv',
-        mime='text/csv'
-    )
-
-if st.button("Download merged dataset (CSV)"):
-    st.download_button(
-        label="Download merged dataset",
-        data=merged_df.to_csv(index=False).encode('utf-8'),
-        file_name='merged_salary_stats.csv',
-        mime='text/csv'
-    )
+st.download_button(
+    label="Download feature importance CSV",
+    data=fi_df[['Feature', 'importance_pct']].sort_values('importance_pct', ascending=False).to_csv(index=False).encode('utf-8'),
+    file_name='salary_feature_importance.csv',
+    mime='text/csv'
+)
+st.download_button(
+    label="Download merged dataset (CSV)",
+    data=merged_df.to_csv(index=False).encode('utf-8'),
+    file_name='merged_salary_stats.csv',
+    mime='text/csv'
+)
 
 st.markdown("---")
+
+# -------------------------
+# Derived metrics display (moved to bottom by request)
+# -------------------------
+st.subheader("Derived metrics (WIN_SHARES, EPA) — sample")
+try:
+    sample_cols = ['PLAYER_NAME', 'TEAM_ABBREVIATION', 'PTS', 'REB', 'AST', 'WIN_SHARES', 'EPA']
+    present = [c for c in sample_cols if c in merged_df.columns]
+    st.dataframe(merged_df[present].head(15))
+except Exception:
+    st.write("Derived metrics not available to preview.")
+
+st.caption("Notes: WIN_SHARES and EPA are simplified / demo calculations. For formal modeling, consider canonical formulas or external advanced metrics sources.")
+
 st.caption("Notes: Predictions assume the same preprocessing used during training. The contribution proxy is a heuristic to help interpret which features moved the prediction; for rigorous explanations use permutation importance or SHAP.")
