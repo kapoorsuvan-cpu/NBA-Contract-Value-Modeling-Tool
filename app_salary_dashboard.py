@@ -1,9 +1,10 @@
-# app_salary_dashboard.py
 """
 Streamlit dashboard for NBA Salary Predictor
 - Top players table now includes raw numeric Predicted_SALARY (dollars)
 - Removed the 'Derived metrics (sample)' section
 - Keeps salary parsing, model training, calibration, and plotting
+- FIX: Predicted_SALARY now computed via bulk prediction on full df_perf
+  (row-by-row prediction caused all values to collapse near the mean ~$14M)
 """
 
 from pathlib import Path
@@ -496,39 +497,43 @@ except Exception as e:
     st.error(f"Unable to create Salary vs Performance plot: {e}")
 
 # -------------------------
-# Top players table with predicted salary (top 10; Predicted_SALARY is raw numeric dollars)
+# Top players table with predicted salary
+# FIX: Use bulk prediction on the full df_perf dataset instead of row-by-row.
+# Row-by-row prediction caused the scaler and calibrator to receive single-point
+# inputs, collapsing all predictions near the mean (~$14M). Bulk prediction
+# mirrors how the model was trained and produces accurate per-player estimates.
 # -------------------------
 st.subheader("Top players by performance metric (top 10)")
 try:
     top_n = 10
     display_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY']
     present_cols = [c for c in display_cols if c in df_perf.columns]
-    top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
 
-    def _pred_row_raw(r):
-        stats = {
-            'PTS': float(r.get('PTS',0.0)),
-            'REB': float(r.get('REB',0.0)),
-            'AST': float(r.get('AST',0.0)),
-            'BLK': float(r.get('BLK',0.0)) if 'BLK' in r else 0.0,
-            'STL': float(r.get('STL',0.0)) if 'STL' in r else 0.0,
-            'TS_PCT': float(r.get('TS_PCT',0.0)) if 'TS_PCT' in r else 0.0,
-            'WIN_SHARES': float(r.get('WIN_SHARES',0.0)) if 'WIN_SHARES' in r else 0.0,
-            'EPA': float(r.get('EPA',0.0)) if 'EPA' in r else 0.0
-        }
-        try:
-            pred, _, _ = predict_salary_calibrated(model_obj, stats)
-            return pred  # raw dollars (float)
-        except Exception:
-            return np.nan
+    # Bulk-predict over the full df_perf so the scaler sees the full distribution
+    try:
+        X_full, _ = model_obj.prepare_features(df_perf)
+        X_full_scaled = model_obj.scaler.transform(X_full)
+        raw_preds_full = model_obj.model.predict(X_full_scaled)
 
-    top_players['Predicted_SALARY'] = top_players.apply(_pred_row_raw, axis=1)
+        if getattr(model_obj, "_calibrator", None) is not None:
+            calibrated_preds = model_obj._calibrator.predict(
+                raw_preds_full.reshape(-1, 1)
+            ).flatten()
+        else:
+            calibrated_preds = raw_preds_full
 
-    # keep SALARY numeric (already parsed earlier)
+        df_perf = df_perf.copy()
+        df_perf['Predicted_SALARY'] = calibrated_preds.astype(float)
+
+    except Exception as pred_err:
+        st.warning(f"Bulk prediction failed: {pred_err}")
+        df_perf['Predicted_SALARY'] = np.nan
+
+    top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols + ['Predicted_SALARY']].copy()
     top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
 
-    # show raw predicted salary in dollars (no pretty formatting)
     st.dataframe(top_players.reset_index(drop=True))
+
 except Exception as e:
     st.error(f"Error building top players table: {e}")
 
