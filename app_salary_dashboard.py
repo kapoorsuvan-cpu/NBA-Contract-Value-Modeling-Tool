@@ -1,10 +1,10 @@
 # app_salary_dashboard.py
 """
 Streamlit dashboard for NBA Salary Predictor
-- Fetch-from-API option is always visible in the sidebar (fix requested)
-- Normalizes uploaded CSVs, merges stats & salary, computes derived metrics
-- Trains model, calibrates, shows feature importance (percentage), predicted vs actual,
-  salary vs performance, top players with predicted salary, and an interactive predictor.
+- Removes slider for top players (fixed top-10)
+- Parses human-formatted salary strings into numeric dollars before training
+- Trains model, fits a small linear calibrator on predictions -> actuals
+- Shows calibrated predictions in top players table and interactive predictor
 """
 
 from pathlib import Path
@@ -40,7 +40,7 @@ st.sidebar.header("Data input")
 
 use_merged_upload = st.sidebar.checkbox("Upload merged stats+salary CSV (recommended)", value=False)
 
-# Always show the fetch-from-API option (requested fix)
+# Always show the fetch-from-API option
 fetch_stats = st.sidebar.checkbox("Fetch current season stats from NBA API (may rate-limit)", value=False)
 
 if use_merged_upload:
@@ -103,20 +103,55 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["TEAM"] = ""
 
-    if "Salary" not in df.columns:
+    # find a salary-like column
+    if "Salary" not in df.columns and "SALARY" not in df.columns:
         found = None
         for cand in ("salary", "sal", "amount", "contract_amount"):
             if cand in lower_map:
                 found = lower_map[cand]
                 break
         if found:
-            df["Salary"] = pd.to_numeric(df[found].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors="coerce")
+            df["Salary"] = df[found]
         else:
             df["Salary"] = pd.NA
 
     df["LAST_NAME"] = df["LAST_NAME"].astype(str).str.strip()
     df["TEAM"] = df["TEAM"].astype(str).str.strip()
     return df
+
+def parse_salary_to_numeric(s):
+    """Parse messy salary strings like '$53.32M', '53,320,000', '53320000' into float dollars."""
+    if pd.isna(s):
+        return np.nan
+    # if already numeric
+    if isinstance(s, (int, float, np.integer, np.floating)):
+        return float(s)
+    s = str(s).strip()
+    if s == "":
+        return np.nan
+    # remove currency symbols and spaces/commas
+    s = s.replace(",", "").replace("$", "").replace(" ", "")
+    # handle trailing M or K
+    try:
+        if s.endswith(("M","m")):
+            num = float(s[:-1])
+            return num * 1_000_000.0
+        if s.endswith(("K","k")):
+            num = float(s[:-1])
+            return num * 1_000.0
+        # sometimes values like '53.32' intended millions? we won't assume that
+        # try plain float
+        return float(s)
+    except Exception:
+        # try to remove non-digit chars then float
+        import re
+        digits = re.sub(r'[^\d.]', '', s)
+        if digits == "":
+            return np.nan
+        try:
+            return float(digits)
+        except Exception:
+            return np.nan
 
 def normalize_stats_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -167,41 +202,28 @@ if use_merged_upload and merged_file is not None:
         st.error(f"Failed to read merged CSV: {e}")
         st.stop()
 
-    # normalize uploaded columns to canonical stat names
+    # normalize columns
     merged_df = normalize_stats_columns(merged_df)
 
-    # required raw columns for derived metrics
+    # check required stat cols
     expected_raw = ["PTS", "REB", "AST", "BLK", "STL", "FGA", "FGM", "FTA", "GP"]
     missing_raw = [c for c in expected_raw if c not in merged_df.columns]
 
-    # If the uploaded "merged" file doesn't actually contain stats (only salary),
-    # attempt to fetch stats and merge if user allowed API fetch.
+    # if merged file is actually salary-only, allow recovery if fetch_stats is enabled
     if missing_raw:
-        st.warning(
-            "The file you uploaded does not contain the required player stat columns "
-            f"({missing_raw}). Trying to recover..."
-        )
-
-        # If user allowed API fetch, treat uploaded file as salary CSV and fetch stats
+        st.warning("Uploaded merged CSV is missing stat columns. Attempting recovery...")
         if fetch_stats:
-            st.info("Treating uploaded file as salary CSV and fetching stats from NBA API (may rate-limit).")
-            # Normalize the uploaded file as a salary dataframe
+            st.info("Fetching stats from NBA API and merging with uploaded salary file.")
             try:
                 salary_df = _ensure_salary_columns(merged_df)
             except Exception as e:
                 st.error(f"Failed to normalize uploaded salary CSV: {e}")
                 st.stop()
-
-            # fetch stats from nba_api
-            with st.spinner("Fetching stats from NBA API..."):
+            with st.spinner("Fetching NBA stats..."):
                 stats_df = collector.get_player_stats()
             if stats_df is None:
-                st.error("Failed to fetch stats from NBA API. Please upload a proper merged CSV or upload a separate stats CSV.")
+                st.error("Failed to fetch stats from NBA API. Please upload proper merged CSV or a separate stats CSV.")
                 st.stop()
-            else:
-                st.success(f"Fetched {len(stats_df)} player stats from NBA API.")
-
-            # set collector inputs and merge
             collector.player_stats = stats_df
             collector.salary_data = salary_df
             with st.spinner("Merging fetched stats with uploaded salary CSV..."):
@@ -211,18 +233,13 @@ if use_merged_upload and merged_file is not None:
                 st.stop()
             else:
                 st.success(f"Merged dataset contains {len(merged_df)} players (after API fetch).")
-
         else:
-            # user did NOT enable fetch; instruct them what to do
             st.error(
-                "The uploaded merged CSV is missing player stat columns required to compute derived metrics. "
-                "Either:\n\n"
-                "• Upload a true merged CSV that includes stats (PTS, REB, AST, BLK, STL, FGA, FGM, FTA, GP) AND a SALARY column; OR\n"
-                "• Enable 'Fetch current season stats from NBA API' in the sidebar so the app will fetch stats and merge with your uploaded salary file.\n\n"
-                "If you intended to upload a salary-only file, un-check 'Upload merged...' and instead upload it as 'Salary CSV', then enable the API fetch."
+                "Uploaded merged CSV does not contain the required stat columns. "
+                "Either upload a merged CSV with stats, or enable 'Fetch current season stats from NBA API' "
+                "so the app can fetch stats and merge with your uploaded salary file."
             )
             st.stop()
-# ---- end replacement ----
 
 # 2) salary + (stats upload or API) path
 else:
@@ -286,6 +303,30 @@ else:
 # ---------- normalize stats columns BEFORE advanced metrics ----------
 merged_df = normalize_stats_columns(merged_df)
 
+# Ensure Salary numeric column exists and convert it
+if 'SALARY' not in merged_df.columns and 'Salary' in merged_df.columns:
+    merged_df['SALARY'] = merged_df['Salary']
+
+if 'SALARY' not in merged_df.columns:
+    # last resort: try to find some salary-like column
+    lower_map = {c.lower(): c for c in merged_df.columns}
+    for cand in ("salary","sal","amount","contract_amount"):
+        if cand in lower_map:
+            merged_df['SALARY'] = merged_df[lower_map[cand]]
+            break
+
+if 'SALARY' not in merged_df.columns:
+    st.error("Merged dataset does not include a Salary column (expected 'SALARY' or 'Salary').")
+    st.stop()
+
+# parse salary strings into numeric dollars
+merged_df['SALARY'] = merged_df['SALARY'].apply(parse_salary_to_numeric)
+
+# check for NaN after parse
+if merged_df['SALARY'].isnull().all():
+    st.error("After parsing, Salary column has no numeric values. Make sure salary values are present and formatted like '$53.32M' or '53320000'.")
+    st.stop()
+
 # Check required raw columns for derived metrics
 expected_raw = ["PTS", "REB", "AST", "BLK", "STL", "FGA", "FGM", "FTA", "GP"]
 missing_raw = [c for c in expected_raw if c not in merged_df.columns]
@@ -312,13 +353,6 @@ except Exception as e:
 
 st.subheader("Preview (first 6 rows)")
 st.dataframe(merged_df.head(6))
-
-# Make sure SALARY canonical column exists (some CSVs use 'Salary' or 'SALARY')
-if 'SALARY' not in merged_df.columns and 'Salary' in merged_df.columns:
-    merged_df['SALARY'] = merged_df['Salary']
-if 'SALARY' not in merged_df.columns:
-    st.error("Merged dataset does not include a Salary column (expected 'SALARY' or 'Salary').")
-    st.stop()
 
 # -------------------------
 # Train model & calibrate
@@ -379,7 +413,10 @@ def predict_salary_calibrated(model_obj, stats: Dict[str,float]):
 # Feature importance (percentage)
 # -------------------------
 st.subheader("Feature importance (percentage of total)")
-fi_df = model_obj.feature_importance.copy()
+fi_df = pd.DataFrame(model_obj.feature_importance).copy() if getattr(model_obj, "feature_importance", None) is not None else pd.DataFrame({
+    "Feature": model_obj.feature_names,
+    "importance": [1.0/len(model_obj.feature_names)]*len(model_obj.feature_names)
+})
 if 'Importance' in fi_df.columns and 'importance' not in fi_df.columns:
     fi_df = fi_df.rename(columns={'Importance':'importance'})
 
@@ -461,11 +498,11 @@ except Exception as e:
     st.error(f"Unable to create Salary vs Performance plot: {e}")
 
 # -------------------------
-# Top players table with predicted salary
+# Top players table with predicted salary (fixed top-10, slider removed)
 # -------------------------
-st.subheader("Top players by performance metric")
-top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10, key="top_n")
+st.subheader("Top players by performance metric (top 10)")
 try:
+    top_n = 10
     display_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY']
     present_cols = [c for c in display_cols if c in df_perf.columns]
     top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
