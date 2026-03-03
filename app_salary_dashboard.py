@@ -1,13 +1,14 @@
 # app_salary_dashboard.py
 """
-Streamlit dashboard for NBA Salary Predictor (updated with stats column normalization)
-- Normalizes common stats column names so add_advanced_metrics won't KeyError.
-- Keeps calibration, fixed feature importance, safe slider, predicted salary column.
+Streamlit dashboard for NBA Salary Predictor
+- Fetch-from-API option is always visible in the sidebar (fix requested)
+- Normalizes uploaded CSVs, merges stats & salary, computes derived metrics
+- Trains model, calibrates, shows feature importance (percentage), predicted vs actual,
+  salary vs performance, top players with predicted salary, and an interactive predictor.
 """
 
 from pathlib import Path
 import io
-import time
 from typing import Optional, Dict
 
 import streamlit as st
@@ -18,24 +19,29 @@ import plotly.express as px
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error
 
-# Import your existing module (must be in the same repo)
+# Try import user module
 try:
     from nba_salary_predictor import NBADataCollector, SalaryPredictionModel
 except Exception as e:
     st.error(
-        "Could not import nba_salary_predictor.py. Make sure the file exists in the repo and contains "
+        "Could not import nba_salary_predictor.py from the repo. "
+        "Ensure that file exists in the same directory and contains "
         "NBADataCollector and SalaryPredictionModel classes."
     )
     st.stop()
 
 st.set_page_config(page_title="NBA Salary Predictor", layout="wide")
-st.title("NBA Salary Predictor — Dashboard (Normalization + Fixes)")
+st.title("NBA Salary Predictor — Dashboard")
 
 # -------------------------
 # Sidebar & inputs
 # -------------------------
 st.sidebar.header("Data input")
+
 use_merged_upload = st.sidebar.checkbox("Upload merged stats+salary CSV (recommended)", value=False)
+
+# Always show the fetch-from-API option (requested fix)
+fetch_stats = st.sidebar.checkbox("Fetch current season stats from NBA API (may rate-limit)", value=False)
 
 if use_merged_upload:
     merged_file = st.sidebar.file_uploader("Merged CSV (must include player stats + SALARY column)", type=["csv"])
@@ -45,11 +51,11 @@ else:
     merged_file = None
     salary_file = st.sidebar.file_uploader("Salary CSV (e.g., nba_salaries_2023_24.csv)", type=["csv"])
     stats_file = st.sidebar.file_uploader("Optional: Player stats CSV (if not using NBA API)", type=["csv"])
-    fetch_stats = st.sidebar.checkbox("Fetch current season stats from NBA API (may rate-limit)", value=False)
 
 train_button = st.sidebar.button("Train / Retrain model")
 st.sidebar.markdown("---")
 st.sidebar.write("Model numeric features expected: PTS, REB, AST, BLK, STL, TS_PCT, WIN_SHARES, EPA")
+st.sidebar.write("If you want the app to fetch live stats, add `nba_api` to requirements.txt before deploying.")
 
 # -------------------------
 # Utilities
@@ -64,19 +70,20 @@ def require_columns(df, cols):
 def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
     """Try to create LAST_NAME, TEAM and numeric Salary columns from common variants."""
     df = salary_df.copy()
-    cols_lower = {c.lower(): c for c in df.columns}
+    lower_map = {c.lower(): c for c in df.columns}
 
     # Find player col
     player_col = None
     for cand in ("player", "player_name", "name", "playername"):
-        if cand in cols_lower:
-            player_col = cols_lower[cand]
+        if cand in lower_map:
+            player_col = lower_map[cand]
             break
 
+    # Find team col
     team_col = None
     for cand in ("team", "team_abbreviation", "tm"):
-        if cand in cols_lower:
-            team_col = cols_lower[cand]
+        if cand in lower_map:
+            team_col = lower_map[cand]
             break
 
     if "LAST_NAME" not in df.columns:
@@ -99,8 +106,8 @@ def _ensure_salary_columns(salary_df: pd.DataFrame) -> pd.DataFrame:
     if "Salary" not in df.columns:
         found = None
         for cand in ("salary", "sal", "amount", "contract_amount"):
-            if cand in cols_lower:
-                found = cols_lower[cand]
+            if cand in lower_map:
+                found = lower_map[cand]
                 break
         if found:
             df["Salary"] = pd.to_numeric(df[found].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors="coerce")
@@ -117,35 +124,29 @@ def normalize_stats_columns(df: pd.DataFrame) -> pd.DataFrame:
     Returns a copy with renamed columns.
     """
     df = df.copy()
-    colmap = {}
     lower = {c.lower(): c for c in df.columns}
+    colmap = {}
 
-    # mapping list: canonical -> list of possible names
-    possible = {
-        "PTS": ["pts", "points", "ppg", "pts_per_game", "pts_pg", "pt"],
+    mapping = {
+        "PTS": ["pts", "points", "ppg", "pts_per_game", "pts_pg"],
         "REB": ["reb", "rebounds", "rpg", "rebounds_per_game", "reb_pg"],
-        "AST": ["ast", "assists", "apg", "ast_pg", "assists_per_game"],
-        "BLK": ["blk", "blocks", "bpg", "blocks_per_game"],
-        "STL": ["stl", "steals", "spg", "steals_per_game"],
-        "FGA": ["fga", "fga_per_game", "fga_pg"],
-        "FGM": ["fgm", "fgm_per_game", "fgm_pg"],
-        "FTA": ["fta", "fta_per_game", "fta_pg"],
-        "TS_PCT": ["ts_pct", "ts%", "true_shooting_pct", "true_shooting_percentage", "ts"],
+        "AST": ["ast", "assists", "apg", "ast_pg"],
+        "BLK": ["blk", "blocks", "bpg"],
+        "STL": ["stl", "steals", "spg"],
+        "FGA": ["fga", "fga_per_game"],
+        "FGM": ["fgm", "fgm_per_game"],
+        "FTA": ["fta", "fta_per_game"],
+        "TS_PCT": ["ts_pct", "ts%", "true_shooting_pct", "true_shooting_percentage"],
         "GP": ["gp", "games", "games_played"],
-        "FG3_PCT": ["fg3_pct", "fg3%", "three_pt_pct", "3p%"],
+        "FG3_PCT": ["fg3_pct", "fg3%", "three_pt_pct"],
     }
 
-    for canonical, variants in possible.items():
-        found = None
+    for canonical, variants in mapping.items():
         for v in variants:
             if v.lower() in lower:
-                found = lower[v.lower()]
+                colmap[lower[v.lower()]] = canonical
                 break
-        if found:
-            colmap[found] = canonical
 
-    # If some canonical expected columns are already present, keep them (no-op).
-    # Perform rename
     if colmap:
         df = df.rename(columns=colmap)
     return df
@@ -157,6 +158,7 @@ st.header("Data loading")
 collector = NBADataCollector(season="2023-24", salary_file="nba_salaries_2023_24.csv")
 merged_df = None
 
+# 1) merged upload path (user supplied file with both stats & salary)
 if use_merged_upload and merged_file is not None:
     try:
         merged_df = read_csv_buffer(merged_file)
@@ -164,6 +166,8 @@ if use_merged_upload and merged_file is not None:
     except Exception as e:
         st.error(f"Failed to read merged CSV: {e}")
         st.stop()
+
+# 2) salary + (stats upload or API) path
 else:
     if salary_file is None:
         st.warning("Upload a salary CSV (or use merged upload) in the sidebar to proceed.")
@@ -176,14 +180,15 @@ else:
         st.error(f"Failed to read salary CSV: {e}")
         st.stop()
 
-    # Normalize salary columns
+    # normalize salary CSV
     try:
         salary_df = _ensure_salary_columns(salary_df)
     except Exception as e:
         st.error(f"Failed to normalize salary CSV: {e}")
         st.stop()
 
-    # Stats: uploaded or fetch
+    # load stats either via upload or via API (if requested)
+    stats_df = None
     if stats_file is not None:
         try:
             stats_df = read_csv_buffer(stats_file)
@@ -195,36 +200,36 @@ else:
         stats_df = None
 
     if stats_df is None and fetch_stats:
-        st.info("Fetching stats from NBA API (may take a minute and can hit rate-limits).")
-        with st.spinner("Fetching stats..."):
+        st.info("Fetching stats from NBA API. This may take a minute and can hit rate limits.")
+        with st.spinner("Fetching NBA stats from nba_api..."):
             stats_df = collector.get_player_stats()
         if stats_df is None:
-            st.error("Failed to fetch stats from NBA API. Upload a stats CSV instead.")
+            st.error("Failed to fetch stats from NBA API. Try uploading a stats CSV instead.")
             st.stop()
         else:
-            st.success(f"Fetched {len(stats_df)} player stats.")
+            st.success(f"Fetched {len(stats_df)} player stats from NBA API.")
 
     if stats_df is None:
-        st.error("No stats available: upload a stats CSV or enable NBA API fetch.")
+        st.error("No player stats available. Either upload a stats CSV or enable NBA API fetch.")
         st.stop()
 
-    # assign and merge
+    # merge using collector logic
     collector.player_stats = stats_df
     collector.salary_data = salary_df
 
-    with st.spinner("Merging stats and salary..."):
+    with st.spinner("Merging stats and salaries..."):
         merged_df = collector.merge_stats_with_salaries()
 
     if merged_df is None or len(merged_df) == 0:
-        st.error("Merging failed. Check name/team columns and the salary CSV structure.")
+        st.error("Merging failed. Inspect names/team abbreviations in your files.")
         st.stop()
-
-    st.success(f"Merged dataset contains {len(merged_df)} players.")
+    else:
+        st.success(f"Merged dataset contains {len(merged_df)} players.")
 
 # ---------- normalize stats columns BEFORE advanced metrics ----------
 merged_df = normalize_stats_columns(merged_df)
 
-# Check that required raw stats exist before calling add_advanced_metrics
+# Check required raw columns for derived metrics
 expected_raw = ["PTS", "REB", "AST", "BLK", "STL", "FGA", "FGM", "FTA", "GP"]
 missing_raw = [c for c in expected_raw if c not in merged_df.columns]
 
@@ -234,7 +239,7 @@ if missing_raw:
         f"{missing_raw}\n\n"
         "Available columns in your merged dataset:\n\n"
         f"{list(merged_df.columns)}\n\n"
-        "Please upload a stats CSV with standard column names or adjust your file so the dashboard can compute derived metrics."
+        "Please upload a stats CSV with standard column names or enable NBA API fetch."
     )
     st.stop()
 
@@ -248,30 +253,28 @@ except Exception as e:
     st.error(f"add_advanced_metrics failed: {e}")
     st.stop()
 
-st.write("Preview (first 6 rows):")
+st.subheader("Preview (first 6 rows)")
 st.dataframe(merged_df.head(6))
 
-required_features = ["PTS", "REB", "AST", "BLK", "STL", "TS_PCT", "WIN_SHARES", "EPA", "Salary", "SALARY"]
-# note: ensure 'SALARY' column exists - earlier _ensure_salary_columns should have created it
+# Make sure SALARY canonical column exists (some CSVs use 'Salary' or 'SALARY')
 if 'SALARY' not in merged_df.columns and 'Salary' in merged_df.columns:
     merged_df['SALARY'] = merged_df['Salary']
-
-missing = require_columns(merged_df, ["PTS", "REB", "AST", "BLK", "STL", "TS_PCT", "WIN_SHARES", "EPA", "SALARY"])
-if missing:
-    st.error(f"Missing required columns needed for training: {missing}. Columns present: {list(merged_df.columns)}")
+if 'SALARY' not in merged_df.columns:
+    st.error("Merged dataset does not include a Salary column (expected 'SALARY' or 'Salary').")
     st.stop()
 
 # -------------------------
 # Train model & calibrate
 # -------------------------
 st.header("Model training & diagnostics")
+
 @st.cache_resource
 def _train_and_calibrate(df: pd.DataFrame, optimize=True):
     model_obj = SalaryPredictionModel()
     X, y = model_obj.prepare_features(df)
     X_test, y_test, y_pred_test = model_obj.train(X, y, optimize=optimize)
 
-    # calibrate predictions -> actual (linear regression on model preds)
+    # calibrate predictions -> actual (simple linear calibrator)
     try:
         preds_full = model_obj.model.predict(model_obj.scaler.transform(X))
         calibrator = LinearRegression()
@@ -285,7 +288,7 @@ def _train_and_calibrate(df: pd.DataFrame, optimize=True):
 
 do_train = train_button or not st.session_state.get("trained_once", False)
 if do_train:
-    with st.spinner("Training (this can take 20-60s depending on dataset & model)..."):
+    with st.spinner("Training (this can take 20-60s)..."):
         try:
             model_obj, X_test, y_test, y_pred, df_perf = _train_and_calibrate(merged_df, optimize=True)
             st.session_state["trained_once"] = True
@@ -298,7 +301,7 @@ else:
     if not st.session_state.get("trained_once", False):
         st.stop()
 
-if 'model_obj' not in locals() or model_obj is None:
+if model_obj is None:
     st.error("Model object not available after training.")
     st.stop()
 
@@ -308,7 +311,7 @@ def predict_salary_calibrated(model_obj, stats: Dict[str,float]):
     raw = model_obj.model.predict(Xs)[0]
     if getattr(model_obj, "_calibrator", None) is not None:
         try:
-            cal = float(model_obj._calibrator.predict(np.array([[raw]]) )[0])
+            cal = float(model_obj._calibrator.predict(np.array([[raw]]))[0])
         except Exception:
             cal = raw
     else:
@@ -343,12 +346,12 @@ fig_fi = px.bar(
     title='Feature importance (percentage of total)'
 )
 fig_fi.update_traces(marker_color='lightskyblue', marker_line_color='black', marker_line_width=1)
-fig_fi.update_layout(height=380, margin=dict(l=140, r=20, t=50, b=40))
+fig_fi.update_layout(height=380, margin=dict(l=160, r=20, t=50, b=40))
 st.plotly_chart(fig_fi, use_container_width=True)
 st.table(table_df.round(2))
 
 # -------------------------
-# Predicted vs Actual (no statsmodels dependency)
+# Predicted vs Actual (no statsmodels required)
 # -------------------------
 st.subheader("Predicted vs Actual Salaries (test set)")
 try:
@@ -404,41 +407,37 @@ except Exception as e:
 # Top players table with predicted salary
 # -------------------------
 st.subheader("Top players by performance metric")
-if df_perf is None or model_obj is None:
-    st.error("Model or performance dataframe unavailable.")
-else:
-    top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10, key="top_n")
-    try:
-        display_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY']
-        present_cols = [c for c in display_cols if c in df_perf.columns]
-        top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
+top_n = st.slider("Number of top players to show", min_value=5, max_value=30, value=10, key="top_n")
+try:
+    display_cols = ['PLAYER_NAME','TEAM_ABBREVIATION','PTS','REB','AST','PERFORMANCE_METRIC','SALARY']
+    present_cols = [c for c in display_cols if c in df_perf.columns]
+    top_players = df_perf.nlargest(top_n, 'PERFORMANCE_METRIC')[present_cols].copy()
 
-        def _pred_row(r):
-            stats = {
-                'PTS': float(r.get('PTS',0.0)),
-                'REB': float(r.get('REB',0.0)),
-                'AST': float(r.get('AST',0.0)),
-                'BLK': float(r.get('BLK',0.0)) if 'BLK' in r else 0.0,
-                'STL': float(r.get('STL',0.0)) if 'STL' in r else 0.0,
-                'TS_PCT': float(r.get('TS_PCT',0.0)) if 'TS_PCT' in r else 0.0,
-                'WIN_SHARES': float(r.get('WIN_SHARES',0.0)) if 'WIN_SHARES' in r else 0.0,
-                'EPA': float(r.get('EPA',0.0)) if 'EPA' in r else 0.0
-            }
-            try:
-                pred, _, _ = predict_salary_calibrated(model_obj, stats)
-                return pred
-            except Exception:
-                return np.nan
+    def _pred_row(r):
+        stats = {
+            'PTS': float(r.get('PTS',0.0)),
+            'REB': float(r.get('REB',0.0)),
+            'AST': float(r.get('AST',0.0)),
+            'BLK': float(r.get('BLK',0.0)) if 'BLK' in r else 0.0,
+            'STL': float(r.get('STL',0.0)) if 'STL' in r else 0.0,
+            'TS_PCT': float(r.get('TS_PCT',0.0)) if 'TS_PCT' in r else 0.0,
+            'WIN_SHARES': float(r.get('WIN_SHARES',0.0)) if 'WIN_SHARES' in r else 0.0,
+            'EPA': float(r.get('EPA',0.0)) if 'EPA' in r else 0.0
+        }
+        try:
+            pred, _, _ = predict_salary_calibrated(model_obj, stats)
+            return pred
+        except Exception:
+            return np.nan
 
-        top_players['Predicted_SALARY'] = top_players.apply(_pred_row, axis=1)
-        # format
-        if 'SALARY' in top_players.columns:
-            top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
-        top_players['Predicted_SALARY'] = top_players['Predicted_SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
-        top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
-        st.dataframe(top_players.reset_index(drop=True))
-    except Exception as e:
-        st.error(f"Error building top players table: {e}")
+    top_players['Predicted_SALARY'] = top_players.apply(_pred_row, axis=1)
+    if 'SALARY' in top_players.columns:
+        top_players['SALARY'] = top_players['SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+    top_players['Predicted_SALARY'] = top_players['Predicted_SALARY'].apply(lambda x: f"${(x/1e6):.2f}M" if pd.notna(x) else "N/A")
+    top_players['PERFORMANCE_METRIC'] = top_players['PERFORMANCE_METRIC'].round(2)
+    st.dataframe(top_players.reset_index(drop=True))
+except Exception as e:
+    st.error(f"Error building top players table: {e}")
 
 # -------------------------
 # Interactive predictor
