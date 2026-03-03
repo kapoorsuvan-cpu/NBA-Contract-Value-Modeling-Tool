@@ -167,6 +167,63 @@ if use_merged_upload and merged_file is not None:
         st.error(f"Failed to read merged CSV: {e}")
         st.stop()
 
+    # normalize uploaded columns to canonical stat names
+    merged_df = normalize_stats_columns(merged_df)
+
+    # required raw columns for derived metrics
+    expected_raw = ["PTS", "REB", "AST", "BLK", "STL", "FGA", "FGM", "FTA", "GP"]
+    missing_raw = [c for c in expected_raw if c not in merged_df.columns]
+
+    # If the uploaded "merged" file doesn't actually contain stats (only salary),
+    # attempt to fetch stats and merge if user allowed API fetch.
+    if missing_raw:
+        st.warning(
+            "The file you uploaded does not contain the required player stat columns "
+            f"({missing_raw}). Trying to recover..."
+        )
+
+        # If user allowed API fetch, treat uploaded file as salary CSV and fetch stats
+        if fetch_stats:
+            st.info("Treating uploaded file as salary CSV and fetching stats from NBA API (may rate-limit).")
+            # Normalize the uploaded file as a salary dataframe
+            try:
+                salary_df = _ensure_salary_columns(merged_df)
+            except Exception as e:
+                st.error(f"Failed to normalize uploaded salary CSV: {e}")
+                st.stop()
+
+            # fetch stats from nba_api
+            with st.spinner("Fetching stats from NBA API..."):
+                stats_df = collector.get_player_stats()
+            if stats_df is None:
+                st.error("Failed to fetch stats from NBA API. Please upload a proper merged CSV or upload a separate stats CSV.")
+                st.stop()
+            else:
+                st.success(f"Fetched {len(stats_df)} player stats from NBA API.")
+
+            # set collector inputs and merge
+            collector.player_stats = stats_df
+            collector.salary_data = salary_df
+            with st.spinner("Merging fetched stats with uploaded salary CSV..."):
+                merged_df = collector.merge_stats_with_salaries()
+            if merged_df is None or len(merged_df) == 0:
+                st.error("Merging failed. Inspect uploaded salary CSV names/team abbreviations.")
+                st.stop()
+            else:
+                st.success(f"Merged dataset contains {len(merged_df)} players (after API fetch).")
+
+        else:
+            # user did NOT enable fetch; instruct them what to do
+            st.error(
+                "The uploaded merged CSV is missing player stat columns required to compute derived metrics. "
+                "Either:\n\n"
+                "• Upload a true merged CSV that includes stats (PTS, REB, AST, BLK, STL, FGA, FGM, FTA, GP) AND a SALARY column; OR\n"
+                "• Enable 'Fetch current season stats from NBA API' in the sidebar so the app will fetch stats and merge with your uploaded salary file.\n\n"
+                "If you intended to upload a salary-only file, un-check 'Upload merged...' and instead upload it as 'Salary CSV', then enable the API fetch."
+            )
+            st.stop()
+# ---- end replacement ----
+
 # 2) salary + (stats upload or API) path
 else:
     if salary_file is None:
